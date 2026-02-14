@@ -1,221 +1,294 @@
-import os
-import glob
-import numpy as np
-import nibabel as nib
-from pathlib import Path
-from sklearn.model_selection import train_test_split
+"""
+===============================================================================
+BraTS 2020 Preprocessing Pipeline
+===============================================================================
+
+High-Level Overview
+-------------------
+This file prepares the raw BraTS MRI dataset for deep learning training.
+
+For each patient case:
+    1) Load 4 MRI modalities + segmentation mask
+    2) Normalize MRI intensities
+    3) Remap segmentation labels to consecutive indices
+    4) Crop around the brain (remove empty background)
+    5) Resize to fixed shape (128×128×128)
+    6) Filter out cases with too little tumor
+    7) Save as fast-loading .npy files
+    8) Create train/validation split
+
+Final output:
+    - images/{case_id}.npy   → shape (4, H, W, D)
+    - masks/{case_id}.npy    → shape (H, W, D)
+    - meta.csv               → tumor statistics
+    - train.txt / val.txt    → dataset split
+===============================================================================
+"""
+
 import csv
+from pathlib import Path
 
-# -------------------------
-# Helpers
-# -------------------------
+import nibabel as nib
+import numpy as np
+from sklearn.model_selection import train_test_split
 
-def load_nii(path: str) -> np.ndarray:
-    """Loads NIfTI and returns float32 array."""
-    return nib.load(path).get_fdata().astype(np.float32)
 
-def normalize_zscore_nonzero(x: np.ndarray, eps=1e-8, clip=5.0) -> np.ndarray:
+MODALITIES = ["t1", "t1ce", "t2", "flair"]
+ALL_FILES = MODALITIES + ["seg"]
+
+
+# =============================================================================
+# I/O
+# =============================================================================
+
+def load_nifti(path: Path) -> np.ndarray:
     """
-    Z-score normalize using only non-zero voxels (brain region),
-    then clip to [-clip, clip], then rescale to [0, 1] (optional).
+    Load a NIfTI file and return a float32 numpy array.
+    Used for both MRI volumes and segmentation masks.
     """
-    mask = x > 0
-    if mask.sum() == 0:
-        return np.zeros_like(x, dtype=np.float32)
+    return nib.load(str(path)).get_fdata().astype(np.float32)
 
-    mu = x[mask].mean()
-    std = x[mask].std()
-    x_norm = (x - mu) / (std + eps)
-    x_norm = np.clip(x_norm, -clip, clip)
 
-    # optional: map to [0,1] (helps some models)
-    x_norm = (x_norm + clip) / (2 * clip)
-    return x_norm.astype(np.float32)
-
-def remap_mask(y: np.ndarray) -> np.ndarray:
-    """BraTS: {0,1,2,4} -> {0,1,2,3} by mapping 4->3"""
-    y = y.astype(np.int16)
-    y[y == 4] = 3
-    return y
-
-def get_nonzero_bbox(vol4: np.ndarray, margin=2):
+def find_case_files(case_dir: Path) -> dict[str, Path] | None:
     """
-    vol4 shape: (C,H,W,D). Compute bbox on union of non-zero across channels.
+    Locate required files inside a BraTS case folder.
+
+    Case requirement:
+        - t1, t1ce, t2, flair
+        - seg
+
+    Case outcome:
+        - If all exist → return dictionary of paths
+        - If any missing → return None (case skipped)
     """
-    union = np.any(vol4 > 0, axis=0)  # (H,W,D)
-    coords = np.array(np.where(union))
-    if coords.size == 0:
-        # fallback: full
-        H, W, D = vol4.shape[1:]
+    files = {}
+    for name in ALL_FILES:
+        matches = list(case_dir.glob(f"*_{name}.nii*"))
+        if not matches:
+            return None  # Case skipped
+        files[name] = matches[0]
+    return files
+
+
+# =============================================================================
+# PREPROCESSING
+# =============================================================================
+
+def normalize_mri(volume: np.ndarray) -> np.ndarray:
+    """
+    Normalize MRI intensities to [0,1].
+
+    Case:
+        - If no brain voxels → return zeros
+        - Otherwise → z-score normalize, clip, rescale
+    """
+    brain = volume > 0
+    if brain.sum() == 0:
+        return np.zeros_like(volume)
+
+    mean = volume[brain].mean()
+    std = volume[brain].std() + 1e-8
+
+    z = (volume - mean) / std
+    z = np.clip(z, -5, 5)
+
+    return ((z + 5) / 10).astype(np.float32)
+
+
+def remap_brats_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Convert BraTS labels from {0,1,2,4} → {0,1,2,3}.
+
+    Case:
+        - Label 4 (enhancing tumor) becomes 3.
+    """
+    mask = mask.astype(np.int16)
+    mask[mask == 4] = 3
+    return mask
+
+
+def compute_brain_bbox(img4: np.ndarray, margin: int = 10):
+    """
+    Compute bounding box around non-zero voxels.
+
+    Case:
+        - If brain found → tight bounding box + margin
+        - If no brain found → return full volume
+    """
+    brain = np.any(img4 > 0, axis=0)
+    coords = np.where(brain)
+
+    H, W, D = img4.shape[1:]
+
+    if coords[0].size == 0:
         return (0, H, 0, W, 0, D)
 
-    zmin, ymin, xmin = coords.min(axis=1)
-    zmax, ymax, xmax = coords.max(axis=1) + 1
+    h0, w0, d0 = (int(c.min()) for c in coords)
+    h1, w1, d1 = (int(c.max()) + 1 for c in coords)
 
-    # NOTE: coords are (H,W,D) indexing? Actually np.where on (H,W,D) -> (h_idx, w_idx, d_idx)
-    hmin, wmin, dmin = coords.min(axis=1)
-    hmax, wmax, dmax = coords.max(axis=1) + 1
+    h0 = max(0, h0 - margin); h1 = min(H, h1 + margin)
+    w0 = max(0, w0 - margin); w1 = min(W, w1 + margin)
+    d0 = max(0, d0 - margin); d1 = min(D, d1 + margin)
 
-    hmin = max(0, hmin - margin); wmin = max(0, wmin - margin); dmin = max(0, dmin - margin)
-    H, W, D = vol4.shape[1:]
-    hmax = min(H, hmax + margin); wmax = min(W, wmax + margin); dmax = min(D, dmax + margin)
+    return (h0, h1, w0, w1, d0, d1)
 
-    return (hmin, hmax, wmin, wmax, dmin, dmax)
 
-def crop_bbox(vol4: np.ndarray, mask: np.ndarray, bbox):
-    hmin, hmax, wmin, wmax, dmin, dmax = bbox
-    return vol4[:, hmin:hmax, wmin:wmax, dmin:dmax], mask[hmin:hmax, wmin:wmax, dmin:dmax]
-
-def center_crop_or_pad_3d(x: np.ndarray, target=(128,128,128), pad_value=0):
+def crop_to_bbox(img4: np.ndarray, mask: np.ndarray, bbox):
     """
-    x shape: (H,W,D) or (C,H,W,D)
-    Center crop if too big, pad if too small.
+    Crop both image and mask using the same bounding box.
+    Ensures spatial alignment remains correct.
     """
-    is_4d = (x.ndim == 4)
-    if is_4d:
-        C, H, W, D = x.shape
-    else:
-        H, W, D = x.shape
-        C = None
+    h0, h1, w0, w1, d0, d1 = bbox
+    return (
+        img4[:, h0:h1, w0:w1, d0:d1],
+        mask[h0:h1, w0:w1, d0:d1],
+    )
 
-    tH, tW, tD = target
 
-    def crop_pad_1dim(arr, dim_size, target_size, axis):
-        # crop
-        if dim_size > target_size:
-            start = (dim_size - target_size) // 2
-            end = start + target_size
-            slicer = [slice(None)] * arr.ndim
-            slicer[axis] = slice(start, end)
-            arr = arr[tuple(slicer)]
-        # pad
-        dim_size = arr.shape[axis]
-        if dim_size < target_size:
-            pad_before = (target_size - dim_size) // 2
-            pad_after = target_size - dim_size - pad_before
-            pad_width = [(0,0)] * arr.ndim
-            pad_width[axis] = (pad_before, pad_after)
-            arr = np.pad(arr, pad_width, mode="constant", constant_values=pad_value)
-        return arr
+def center_crop_or_pad(x: np.ndarray, target=(128, 128, 128)):
+    """
+    Force volume to target size.
 
-    if is_4d:
-        x = crop_pad_1dim(x, x.shape[1], tH, axis=1)
-        x = crop_pad_1dim(x, x.shape[2], tW, axis=2)
-        x = crop_pad_1dim(x, x.shape[3], tD, axis=3)
-    else:
-        x = crop_pad_1dim(x, x.shape[0], tH, axis=0)
-        x = crop_pad_1dim(x, x.shape[1], tW, axis=1)
-        x = crop_pad_1dim(x, x.shape[2], tD, axis=2)
+    Cases:
+        - If dimension > target → center crop
+        - If dimension < target → center pad
+        - If equal → unchanged
+    """
+    for axis, t in zip(range(-3, 0), target):
+        s = x.shape[axis]
+
+        if s > t:
+            start = (s - t) // 2
+            x = np.take(x, range(start, start + t), axis=axis)
+
+        elif s < t:
+            pad = t - s
+            before = pad // 2
+            after = pad - before
+
+            pad_width = [(0, 0)] * x.ndim
+            pad_width[axis] = (before, after)
+            x = np.pad(x, pad_width)
 
     return x
 
-def tumor_fraction(mask: np.ndarray) -> float:
-    return float((mask > 0).sum()) / float(mask.size)
 
-# -------------------------
-# Main preprocessing
-# -------------------------
+# =============================================================================
+# MAIN PIPELINE
+# =============================================================================
 
 def preprocess_brats(
-    raw_root: str,
-    out_root: str,
-    target_shape=(128,128,128),
-    min_tumor_fraction=0.001,   # 0.1% as a starting point
-    val_ratio=0.2,
-    seed=42
+    raw_dir: str,
+    out_dir: str,
+    target_shape=(128, 128, 128),
+    min_tumor_fraction=0.001,
+    val_split=0.2,
+    seed=42,
 ):
-    raw_root = Path(raw_root)
-    out_root = Path(out_root)
-    img_out = out_root / "images"
-    msk_out = out_root / "masks"
-    img_out.mkdir(parents=True, exist_ok=True)
-    msk_out.mkdir(parents=True, exist_ok=True)
+    """
+    Execute full preprocessing pipeline.
 
-    case_dirs = sorted([p for p in raw_root.glob("BraTS20_Training_*") if p.is_dir()])
-    kept_cases = []
-    rows = []
+    Case handling:
+        - Missing files → case skipped
+        - Tumor fraction too small → case dropped
+        - Valid case → processed and saved
+    """
+
+    raw = Path(raw_dir)
+    out = Path(out_dir)
+
+    (out / "images").mkdir(parents=True, exist_ok=True)
+    (out / "masks").mkdir(parents=True, exist_ok=True)
+
+    case_dirs = sorted(raw.glob("BraTS20_Training_*"))
+
+    kept_ids = []
+    meta_rows = []
 
     for case_dir in case_dirs:
         case_id = case_dir.name
 
-        # Find modality files (handles .nii or .nii.gz)
-        def f(suffix):
-            hits = list(case_dir.glob(f"*_{suffix}.nii")) + list(case_dir.glob(f"*_{suffix}.nii.gz"))
-            return str(hits[0]) if hits else None
-
-        flair = f("flair")
-        t1    = f("t1")
-        t1ce  = f("t1ce")
-        t2    = f("t2")
-        seg   = f("seg")
-
-        if not all([flair, t1, t1ce, t2, seg]):
-            print(f"[SKIP] Missing files in {case_id}")
+        files = find_case_files(case_dir)
+        if files is None:
+            print(f"[SKIP] {case_id}")
             continue
 
-        # Load
-        v_flair = load_nii(flair)
-        v_t1    = load_nii(t1)
-        v_t1ce  = load_nii(t1ce)
-        v_t2    = load_nii(t2)
-        y       = load_nii(seg).astype(np.int16)
+        vols = {m: normalize_mri(load_nifti(files[m])) for m in MODALITIES}
+        mask = remap_brats_mask(load_nifti(files["seg"]))
 
-        # Normalize each modality
-        v_flair = normalize_zscore_nonzero(v_flair)
-        v_t1    = normalize_zscore_nonzero(v_t1)
-        v_t1ce  = normalize_zscore_nonzero(v_t1ce)
-        v_t2    = normalize_zscore_nonzero(v_t2)
+        img4 = np.stack([vols["t1"], vols["t1ce"], vols["t2"], vols["flair"]], axis=0)
 
-        # Stack: (C,H,W,D)
-        x = np.stack([v_t1, v_t1ce, v_t2, v_flair], axis=0).astype(np.float32)
+        bbox = compute_brain_bbox(img4)
+        img4, mask = crop_to_bbox(img4, mask, bbox)
 
-        # Remap mask 4->3
-        y = remap_mask(y)
+        img4 = center_crop_or_pad(img4, target_shape)
+        mask = center_crop_or_pad(mask, target_shape)
 
-        # Crop to non-zero bbox
-        bbox = get_nonzero_bbox(x, margin=2)
-        x, y = crop_bbox(x, y, bbox)
+        tumor_fraction = float((mask > 0).sum()) / mask.size
 
-        # Center crop/pad to target
-        x = center_crop_or_pad_3d(x, target=target_shape, pad_value=0)
-        y = center_crop_or_pad_3d(y, target=target_shape, pad_value=0)
-
-        # Drop if too little tumor
-        tf = tumor_fraction(y)
-        if tf < min_tumor_fraction:
-            # You can choose to keep them later for "negative" learning,
-            # but for now you asked to drop low-labeled volumes.
-            print(f"[DROP] {case_id} tumor_fraction={tf:.6f}")
+        if tumor_fraction < min_tumor_fraction:
+            print(f"[DROP] {case_id}")
             continue
 
-        # Save
-        np.save(img_out / f"{case_id}.npy", x)
-        np.save(msk_out / f"{case_id}.npy", y)
+        np.save(out / "images" / f"{case_id}.npy", img4)
+        np.save(out / "masks" / f"{case_id}.npy", mask)
 
-        kept_cases.append(case_id)
-        rows.append([case_id, tf])
+        kept_ids.append(case_id)
+        meta_rows.append([case_id, tumor_fraction])
 
-        print(f"[OK] {case_id} saved | tumor_fraction={tf:.6f}")
+        print(f"[OK] {case_id}")
 
-    # Save meta
-    with open(out_root / "meta.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["case_id", "tumor_fraction"])
-        w.writerows(rows)
+    with open(out / "meta.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["case_id", "tumor_fraction"])
+        writer.writerows(meta_rows)
 
-    # Split
-    train_ids, val_ids = train_test_split(kept_cases, test_size=val_ratio, random_state=seed, shuffle=True)
+    train_ids, val_ids = train_test_split(
+        kept_ids, test_size=val_split, random_state=seed
+    )
 
-    (out_root / "train.txt").write_text("\n".join(train_ids))
-    (out_root / "val.txt").write_text("\n".join(val_ids))
+    (out / "train.txt").write_text("\n".join(train_ids))
+    (out / "val.txt").write_text("\n".join(val_ids))
 
-    print(f"\nDone. Kept {len(kept_cases)} cases.")
-    print(f"Train: {len(train_ids)} | Val: {len(val_ids)}")
+    print(f"Processed {len(kept_ids)} cases.")
+
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 
 if __name__ == "__main__":
+    """
+    Script entry point.
+
+    This block runs only when the file is executed directly:
+        python preprocess.py
+
+    Modify the paths and parameters below if needed.
+    """
+
+    # -------------------------------------------------------------------------
+    # Configuration
+    # -------------------------------------------------------------------------
+    RAW_DATA_DIR = "data/raw/archive/BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData"
+    OUTPUT_DIR = "data/processed"
+
+    TARGET_SHAPE = (128, 128, 128)
+    VALIDATION_SPLIT = 0.2
+    MIN_TUMOR_FRACTION = 0.001
+    RANDOM_SEED = 42
+    
+    # -------------------------------------------------------------------------
+    # Run preprocessing
+    # -------------------------------------------------------------------------
     preprocess_brats(
-        raw_root="data/raw/archive/BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData",
-        out_root="data/processed",
-        target_shape=(128,128,128),
-        min_tumor_fraction=0.001
+        raw_dir=RAW_DATA_DIR,
+        out_dir=OUTPUT_DIR,
+        target_shape=TARGET_SHAPE,
+        min_tumor_fraction=MIN_TUMOR_FRACTION,
+        val_split=VALIDATION_SPLIT,
+        seed=RANDOM_SEED,
     )
+
+    print("\nPreprocessing completed successfully.")
